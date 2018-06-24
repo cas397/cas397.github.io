@@ -1,0 +1,156 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Christian Segarra"
+date: "June 23, 2018"
+output: html_document
+---
+
+## Executive Summary
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. The goal of this analysis was to use that data to buid a predictive model that could predict how well an individual is performing an exercise. In this case, the exercise was bicep curls.  
+
+The data was supplied from http://groupware.les.inf.puc-rio.br/har & contains data on 6 subjects performing the bicep curl in 5 different ways. 1 way was the correct way, the other 4 were common variations of incorrect form. Through testing various models, we find that a Random Forest prediction model produced the highest prediction accuracy.
+
+## Data Pre-Processing
+
+```{r preprocess, echo=FALSE, message=FALSE, warning=FALSE, comment=""}
+library(caret)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+#Read in data
+training_data <- read.csv(file = "C:/Users/cas39/Downloads/pml-training.csv", stringsAsFactors = FALSE)
+testing_data <- read.csv(file = "C:/Users/cas39/Downloads/pml-testing.csv", stringsAsFactors = FALSE)
+```
+
+Reading in the data we see that there are `r nrow(training_data)` observations and `r ncol(training_data)` potential predictors. The size of the data set and large number of predictors could add noise to our model or cause computation times to be long. We should reduce the number of predictors in this data set.  
+
+First let us transform all predictors to class numeric. Categorical variables such as user_name & new_window will be transformed into distinct numericals. Dates and times will also be represented as numericals. This will be done for both the training & testing data sets.
+
+```{r pressure, echo=FALSE, message=FALSE, warning=FALSE, comment=""}
+#Remove column X as it is just a row number
+training_data <- training_data %>% select(-X) %>% mutate(cvtd_timestamp = as.numeric(dmy_hm(cvtd_timestamp)), classe = factor(x = classe, levels = unique(classe)))
+
+#Transform categorical predictors to numeric for both training & testing data sets
+#Transform date/datetime predictors to numeric
+training_data[training_data$new_window == "no", "new_window"] <- 0
+training_data[training_data$new_window == "yes", "new_window"] <- 1
+testing_data <- testing_data %>% select(-X) %>% mutate(cvtd_timestamp = as.numeric(dmy_hm(cvtd_timestamp)), problem_id = factor(x = problem_id, levels = unique(problem_id)))
+testing_data[testing_data$new_window == "no", "new_window"] <- 0
+testing_data[testing_data$new_window == "yes", "new_window"] <- 1
+
+j <- 0
+for (i in unique(training_data$user_name))
+{
+  j <- j + 1
+  training_data$user_name <- gsub(pattern = i, replacement = j, x = training_data$user_name)
+  testing_data$user_name <- gsub(pattern = i, replacement = j, x = testing_data$user_name)
+}
+
+#convert columns that should be numeric from character
+training_data[ , -ncol(training_data)] <- apply(X = training_data[ , -ncol(training_data)], MARGIN = 2, FUN = as.numeric)
+testing_data[ , -ncol(testing_data)] <- apply(X = testing_data[ , -ncol(testing_data)], MARGIN = 2, FUN = as.numeric)
+```
+
+## Feature Selection
+
+Next, let us look to eliminate predictors. We look for any NA values in our dataset to see how any potential NA values could impact our data set.
+
+```{r nas, echo=FALSE, message=FALSE, warning=FALSE, comment=""}
+#Look for any NAs in the data set & see how it affects the analysis
+find_na_cols <- apply(X = training_data, MARGIN = 2, FUN = function(x) sum(is.na(x)))
+find_na_rows <- apply(X = training_data, MARGIN = 1, FUN = function(x) sum(is.na(x)))
+na_row_index <- as.logical(find_na_rows)
+
+#Identify columns that contain NA values & compute how many columns and rows contain NA values
+na_cols <- find_na_cols %>% as.vector() %>% as.logical()
+num_na_cols <- sum(na_cols)
+min_na_rows <- find_na_cols[find_na_cols != 0] %>% as.vector() %>% min()
+```
+
+We see that there are `r num_na_cols` predictors that contain NA values. Looking at columns that only contain NA values, we see that the column with the smallest number of NA values, contains `r min_na_rows` NA values. Given that the number of observations in our data set is `r nrow(training_data)`, then these columns are comprised of at least `r scales::percent(round(min_na_rows/nrow(training_data), digits = 2))` NA values. Therefore, we eliminate all of these columns.
+
+```{r remove_na, echo=FALSE, message=FALSE, warning=FALSE, comment=""}
+print(names(training_data)[!na_cols])
+training_data <- training_data[ , names(training_data)[!na_cols]]
+```
+
+Eliminating these NA columns still leave us with `r ncol(training_data)` potential predictors. We next try to eliminate more variables by searching for any predictors that have zero or near zero variance.
+
+```{r near_zero, echo=FALSE, message=FALSE, warning=FALSE, comment=""}
+list_of_nsv <- nearZeroVar(x = training_data[ , -ncol(training_data)], saveMetrics = TRUE)
+nsv <- nearZeroVar(x = training_data[ , -ncol(training_data)])
+training_data <- training_data[ , -(nsv)]
+print(rownames(list_of_nsv[nsv, ]))
+```
+
+After eliminating predictors with little to no variability, we are still left with `r ncol(training_data)` predictors. To further reduce the number of predictors, we will eliminate predictors that have a high correlation with other predictors (keeping only 1 predictor), because if they are highly correlated, they will not add much additional value to our model. We will use a correlation threshold of 0.8.
+
+```{r correlated, echo=FALSE, message=FALSE, warning=FALSE, comment=""}
+#Find correlation matrix
+correlations <- abs(cor(training_data[ , -ncol(training_data)]))
+diag(correlations) <- 0
+violators <- which(correlations > .8, arr.ind = T)
+violators <- as.data.frame(x = violators)
+
+j <- 0
+removed_predictors <- c()
+#Remove highly correlated predictors (keeping only 1 of them)
+while (nrow(violators) > 0)
+{
+  j <- j + 1
+  col_index <- violators[1, "col"]
+  remove_these <- rownames(violators[violators$col == col_index, ])
+  removed_predictors <- c(removed_predictors, remove_these)
+  
+  if (!is.na(col_index))
+  {
+    training_data <- training_data %>% select(-remove_these)
+  }
+  
+  correlations <- abs(cor(training_data[ , -ncol(training_data)]))
+  diag(correlations) <- 0
+  violators <- which(correlations > .8, arr.ind = T)
+  violators <- as.data.frame(x = violators)
+}
+print(removed_predictors)
+```
+
+After removing highly correlated predictors, we are left with `r ncol(training_data)` predictors. We will consider this predictor elimination sufficient.
+
+## Model Selection
+
+We will test several models using cross validation on the training data set. We will then choose the most accurate model or ensemble/stack of models to use on testing data set. Since we are trying to predict a response that contains 5 potential outcomes, we will not test any generalized linear regression models. We will mainly be testing classification based models. The list of models are:
+
+  * Classification Trees ("rpart")
+  * Boosting ("gbm")
+  * Linear Discriminant Analysis ("lda")
+  * Random Forests ("rf")
+
+```{r model_testing, echo=FALSE, message=FALSE, warning=FALSE, comment=""}
+#Train models using k folds cross validation
+tree_model <- train(classe ~., data = training_data, trControl = trainControl(method = "cv"), method = "rpart")
+gbm_model <- train(classe ~., data = training_data, trControl = trainControl(method = "cv"), method = "gbm", verbose = FALSE)
+lda_model <- train(classe ~., data = training_data, trControl = trainControl(method = "cv"), method = "lda")
+rf_model <- train(classe ~., data = training_data, trControl = trainControl(method = "cv"), method="rf")
+
+#Print results of models
+print(tree_model$results)
+print(gbm_model$results)
+print(lda_model$results)
+print(rf_model$results)
+```
+
+We can see from the results, that the classification tree method performed very poorly, with an estimated accuracy rate of `r scales::percent(round(max(tree_model$results$Accuracy), digits = 3))`. The Linear Discriminant Analysis also did not perform that well, with an estimated accuracy of `r scales::percent(round(lda_model$results$Accuracy, digits = 3))`. Boosting performed well, having an estimated accuracy of `r scales::percent(round(max(gbm_model$results$Accuracy), digits = 3))`. However, the Random Forest model produces the highest accuracy, with an estimated out of sample accuracy of `r scales::percent(round(max(rf_model$results$Accuracy), digits = 3))`. Since this is already near 100%, there is not much benefit in trying to create an ensemble of models or stack the models. We will just use a pure Random Forest approach as our prediction model.
+
+## Final Results
+
+We use our Random Forest model to predict the classe response in our testing data set. We get the below results
+```{r predict_testing, echo=FALSE, message=FALSE, warning=FALSE, comment=""}
+print(rf_model$finalModel)
+rf_predict <- predict(rf_model, newdata = testing_data)
+print(data.frame(problem_id = 1:20, predict_classe = rf_predict))
+```
+
+These predictions result in 100% accuracy based on the quiz results.
